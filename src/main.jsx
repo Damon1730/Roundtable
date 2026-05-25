@@ -107,8 +107,10 @@ function App() {
 
   useEffect(() => {
     localStorage.setItem('activeMeetingId', meetingId);
-    loadMeeting(meetingId);
-  }, [meetingId]);
+    if (activeHistory) {
+      loadMeeting(meetingId);
+    }
+  }, [meetingId, activeHistory]);
 
   useEffect(() => {
     loadHistory();
@@ -132,7 +134,6 @@ function App() {
     }
 
     if (!response.ok) {
-      setMessages([]);
       return;
     }
 

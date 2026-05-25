@@ -412,7 +412,7 @@ function buildFollowupWorkflow(roles, topic, contextMessages, round) {
     id: role.id,
     role: role.id,
     name: role.name,
-    task: `你将基于以下会议上下文，仅进行第 ${round} 轮追问，最多追问 ${MAX_FOLLOWUP_ROUNDS} 轮。\n\n会议主题：${topic}\n\n上下文：\n${contextText}\n\n请以${role.name}身份发言：提出一个新的追问，避免重复前面的内容。`,
+    task: `请以${role.name}的专业视角，基于以下会议上下文，仅进行第 ${round} 轮追问，最多追问 ${MAX_FOLLOWUP_ROUNDS} 轮。\n\n会议主题：${topic}\n\n上下文：\n${contextText}\n\n要求：提出一个直接针对主题和上下文的新追问，避免重复前面的内容，不要复述你的身份设定。`,
     output: `${role.id}_followup_${round}`,
     depends_on: undefined,
   }));
@@ -456,7 +456,7 @@ function buildRoundtableWorkflow(roles, topic) {
     id: role.id,
     role: role.id,
     name: role.name,
-    task: `以${role.name}身份发言：${role.prompt || `围绕主题「${topic}」发言。`}`,
+    task: `请以${role.name}的专业视角，围绕以下主题发表你的观点和建议：\n\n主题：${topic}\n\n要求：直接针对主题给出专业分析，不要复述你的身份设定。`,
     output: `${role.id}_speech`,
     depends_on: undefined,
   }));
@@ -527,8 +527,8 @@ function createDeepSeekConnector() {
 
 function createMockConnector() {
   return {
-    async chat(_systemPrompt, userMessage) {
-      if (userMessage.includes('[[timeout]]')) {
+    async chat(systemPrompt, userMessage) {
+      if (systemPrompt.includes('[[timeout]]') || userMessage.includes('[[timeout]]')) {
         await new Promise(() => {});
       }
       return {
@@ -575,7 +575,7 @@ function createRoundtableConnector(meetingId, meetingTitle, emit, roles) {
 }
 
 function currentRoleName(userMessage) {
-  const match = userMessage.match(/以(.+?)身份发言/);
+  const match = userMessage.match(/以(.+?)(?:身份发言|的专业视角)/);
   return match ? match[1] : '角色';
 }
 

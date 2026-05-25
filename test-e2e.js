@@ -352,12 +352,11 @@ async function test5_mockMode() {
   const speeches = events.filter((e) => e.type === 'speech' && e.roleId !== 'summary');
   
   // Mock模式下，speech.content是userMessage的echo
-  // userMessage格式: "以{roleName}身份发言：{prompt}"
+  // userMessage应只包含讨论任务和主题，不应泄露角色system prompt
   assert(speeches.length === 3, `Mock模式产出3条speech (got ${speeches.length})`);
   if (speeches.length >= 3) {
-    assert(speeches[0].content.includes('特定内容XYZ'), 'Mock: speech[0]含原始prompt');
-    assert(speeches[1].content.includes('特定内容ABC'), 'Mock: speech[1]含原始prompt');
-    assert(speeches[2].content.includes('特定内容DEF'), 'Mock: speech[2]含原始prompt');
+    assert(speeches.every((s) => s.content.includes('主题：Mock测试')), 'Mock: speech包含讨论主题');
+    assert(speeches.every((s) => !s.content.includes('特定内容')), 'Mock: speech不含原始prompt');
   }
 
   // Health endpoint
