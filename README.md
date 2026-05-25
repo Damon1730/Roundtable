@@ -77,6 +77,20 @@ TEST_PORT=3002 node test-e2e.js
 └── 会议纪要/                # 项目文档
 ```
 
+## 变更记录
+
+### Alpha 封存 (2026-05-26)
+
+**v0.1.0** — `6f63afe`
+
+- feat: 完整圆桌会议流程（自动选角 → 并行讨论 → 总结）
+- feat: 前端去掉硬编码角色，启用 DeepSeek 自动选角
+- feat: DAG 并行执行 concurrency 提升至 3
+- fix: **角色 prompt 工程重构** — 角色 .md 全文作为 system prompt，topic 作为 user message，解决角色只复述人设不讨论主题的问题
+- fix: 前端 404 时序问题 — 新建会议不再触发无效 HTTP 请求
+- fix: mock timeout 竞态条件
+- chore: 清理冗余文件，补全 .gitignore
+
 ## License
 
 MIT
