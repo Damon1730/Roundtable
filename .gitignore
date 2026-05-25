@@ -1,0 +1,9 @@
+node_modules/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+.roundtable-agents/
+dist/
+agency-agents-zh/
