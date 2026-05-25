@@ -13,7 +13,10 @@ const ROLE_SELECTION_TIMEOUT_MS = Number(process.env.ROLE_SELECTION_TIMEOUT_MS |
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
 const AGENTS_DIR = process.env.AGENTS_DIR || resolveAgentsDir();
 const MAX_FOLLOWUP_ROUNDS = 2;
+const INITIAL_DISCUSSION_ROUNDS = 2;
 const SUMMARY_ROLE = { id: 'summary', name: '会议总结', prompt: '总结会议结论、分歧和行动建议。' };
+const ROUNDTABLE_CONCURRENCY = Number(process.env.ROUNDTABLE_CONCURRENCY || 3);
+const DISCUSSION_DELAY_MS = Number(process.env.ROUNDTABLE_DISCUSSION_DELAY_MS || 900);
 
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -212,8 +215,8 @@ async function handleFollowupRequest(req, res, meetingId) {
       return;
     }
 
-    const currentRound = messageCount / roles.length;
-    if (currentRound > MAX_FOLLOWUP_ROUNDS) {
+    const currentRound = Math.max(0, (messageCount / roles.length) - INITIAL_DISCUSSION_ROUNDS);
+    if (currentRound >= MAX_FOLLOWUP_ROUNDS) {
       sendHttpJson(res, 409, { error: 'followup_limit_reached' });
       return;
     }
@@ -270,6 +273,7 @@ async function runRoundtable(ws, payload) {
   const meetingTitle = normalizeOptionalString(payload.meetingTitle);
   const topic = normalizeRequiredString(payload.topic, 'topic');
   const roles = Array.isArray(payload.roles) ? normalizeRoles(payload.roles) : await selectRoles(topic);
+  const emit = (payload) => sendJson(ws, payload);
 
   if (!Array.isArray(payload.roles)) {
     sendJson(ws, {
@@ -281,49 +285,64 @@ async function runRoundtable(ws, payload) {
 
   ensureMeeting.run({ id: meetingId, title: meetingTitle, status: 'pending' });
 
-  const workflow = buildRoundtableWorkflow(roles, topic);
-  const dag = buildDAG(workflow);
-  hydrateDagAgents(dag, [...roles, SUMMARY_ROLE]);
-  const connector = createRoundtableConnector(meetingId, meetingTitle, (payload) => sendJson(ws, payload), [...roles, SUMMARY_ROLE]);
   const agentsDir = ensureAgentFiles([...roles, SUMMARY_ROLE]);
-
-  updateMeetingState(meetingId, 'running', (payload) => sendJson(ws, payload));
-  const result = await executeDAG(dag, {
-    connector,
-    agentsDir,
-    llmConfig: { provider: 'deepseek', model: DEEPSEEK_MODEL, timeout: ROLE_TIMEOUT_MS, retry: 0 },
-    concurrency: 3,
-    inputs: new Map([['topic', topic]]),
-    onStepStart: (node) => {
-      const role = roleById([...roles, SUMMARY_ROLE], node.step.id);
-      sendJson(ws, {
-        type: 'thinking',
-        meetingId,
-        roleId: role.id,
-        roleName: role.name,
-        content: node.step.id === SUMMARY_ROLE.id ? '会议总结正在整理' : `${role.name} 正在思考`,
-      });
-    },
-    onStepComplete: (node) => {
-      const role = roleById([...roles, SUMMARY_ROLE], node.step.id);
-      if (node.status === 'failed') {
-        sendJson(ws, {
-          type: 'role_error',
+  const connector = createRoundtableConnector(meetingId, meetingTitle, emit, [...roles, SUMMARY_ROLE]);
+  const runStage = (workflow, stageRoles = roles) => {
+    const dag = buildDAG(workflow);
+    hydrateDagAgents(dag, [...stageRoles, SUMMARY_ROLE]);
+    return executeDAG(dag, {
+      connector,
+      agentsDir,
+      llmConfig: { provider: 'deepseek', model: DEEPSEEK_MODEL, timeout: ROLE_TIMEOUT_MS, retry: 0 },
+      concurrency: ROUNDTABLE_CONCURRENCY,
+      inputs: new Map([['topic', topic]]),
+      onStepStart: (node) => {
+        const role = roleById([...stageRoles, SUMMARY_ROLE], nodeRoleId(node));
+        emit({
+          type: 'thinking',
           meetingId,
           roleId: role.id,
           roleName: role.name,
-          message: node.error || 'role execution failed',
+          content: nodeRoleId(node) === SUMMARY_ROLE.id ? '会议总结正在整理' : `${role.name} 正在思考`,
         });
-      }
-    },
-  });
+      },
+      onStepComplete: (node) => {
+        const role = roleById([...stageRoles, SUMMARY_ROLE], nodeRoleId(node));
+        if (node.status === 'failed') {
+          emit({
+            type: 'role_error',
+            meetingId,
+            roleId: role.id,
+            roleName: role.name,
+            message: node.error || 'role execution failed',
+          });
+        }
+      },
+    });
+  };
 
-  if (meetingCompleted(result)) {
-    updateMeetingState(meetingId, 'done', (payload) => sendJson(ws, payload));
-    sendJson(ws, { type: 'done', meetingId, status: 'done' });
+  updateMeetingState(meetingId, 'running', emit);
+  const firstRoundResult = await runStage(buildRoundtableWorkflow(roles, topic));
+  const firstRoundMessages = listRoundMessages(meetingId);
+  let responseResult = { success: true, steps: [] };
+  if (firstRoundMessages.length > 1) {
+    const responseRoles = roles.filter((role) => firstRoundMessages.some((message) => message.speaker === role.name));
+    responseResult = await runStage(
+      buildResponseWorkflow(responseRoles, topic, firstRoundMessages),
+      responseRoles,
+    );
+  }
+  const summaryResult = await runStage(
+    buildSummaryWorkflow(roles, topic, listRoundMessages(meetingId)),
+    roles,
+  );
+
+  if (meetingCompleted(summaryResult)) {
+    updateMeetingState(meetingId, 'done', emit);
+    emit({ type: 'done', meetingId, status: 'done' });
   } else {
-    updateMeetingState(meetingId, 'failed', (payload) => sendJson(ws, payload));
-    sendJson(ws, { type: 'done', meetingId, status: 'failed' });
+    updateMeetingState(meetingId, 'failed', emit);
+    emit({ type: 'done', meetingId, status: 'failed' });
   }
 }
 
@@ -346,8 +365,8 @@ async function runFollowup(ws, payload) {
     return;
   }
 
-  const currentRound = messageCount / roles.length;
-  if (currentRound > MAX_FOLLOWUP_ROUNDS) {
+  const currentRound = Math.max(0, (messageCount / roles.length) - INITIAL_DISCUSSION_ROUNDS);
+  if (currentRound >= MAX_FOLLOWUP_ROUNDS) {
     sendJson(ws, { type: 'error', code: 'followup_limit_reached', message: 'followup_limit_reached' });
     return;
   }
@@ -367,24 +386,24 @@ async function runFollowup(ws, payload) {
     connector,
     agentsDir,
     llmConfig: { provider: 'deepseek', model: DEEPSEEK_MODEL, timeout: ROLE_TIMEOUT_MS, retry: 0 },
-    concurrency: 3,
+    concurrency: ROUNDTABLE_CONCURRENCY,
     inputs: new Map([
       ['topic', topic],
       ['context', formatMeetingContext(contextMessages)],
       ['round', String(round)],
     ]),
     onStepStart: (node) => {
-      const role = roleById([...roles, SUMMARY_ROLE], node.step.id);
+      const role = roleById([...roles, SUMMARY_ROLE], nodeRoleId(node));
       emitFn({
         type: 'thinking',
         meetingId,
         roleId: role.id,
         roleName: role.name,
-        content: node.step.id === SUMMARY_ROLE.id ? '会议总结正在整理' : `${role.name} 正在追问`,
+        content: nodeRoleId(node) === SUMMARY_ROLE.id ? '会议总结正在整理' : `${role.name} 正在追问`,
       });
     },
     onStepComplete: (node) => {
-      const role = roleById([...roles, SUMMARY_ROLE], node.step.id);
+      const role = roleById([...roles, SUMMARY_ROLE], nodeRoleId(node));
       if (node.status === 'failed') {
         emitFn({
           type: 'role_error',
@@ -412,7 +431,7 @@ function buildFollowupWorkflow(roles, topic, contextMessages, round) {
     id: role.id,
     role: role.id,
     name: role.name,
-    task: `请以${role.name}的专业视角，基于以下会议上下文，仅进行第 ${round} 轮追问，最多追问 ${MAX_FOLLOWUP_ROUNDS} 轮。\n\n会议主题：${topic}\n\n上下文：\n${contextText}\n\n要求：提出一个直接针对主题和上下文的新追问，避免重复前面的内容，不要复述你的身份设定。`,
+    task: `请以${role.name}的专业视角，基于以下会议上下文回答第 ${round} 轮追问。\n\n会议主题：${topic}\n\n上下文：\n${contextText}\n\n要求：像圆桌会议中的一次短发言，控制在 120-220 字；先回应前面观点，再给出一个新的判断或补充；不要复述身份设定。`,
     output: `${role.id}_followup_${round}`,
     depends_on: undefined,
   }));
@@ -421,7 +440,7 @@ function buildFollowupWorkflow(roles, topic, contextMessages, round) {
     name: 'roundtable-followup',
     agents_dir: '.',
     llm: { provider: 'deepseek', model: DEEPSEEK_MODEL, timeout: ROLE_TIMEOUT_MS, retry: 0 },
-    concurrency: 3,
+    concurrency: ROUNDTABLE_CONCURRENCY,
     steps: [
       ...roleSteps,
       buildSummaryStep(roles, topic, roleSteps, contextText),
@@ -433,6 +452,14 @@ function formatMeetingContext(messages) {
   return messages.map((message) => `${message.speaker}: ${message.content}`).join('\n');
 }
 
+function listRoundMessages(meetingId) {
+  return listMessagesByMeeting.all(meetingId).filter((message) => message.speaker !== SUMMARY_ROLE.name);
+}
+
+function formatRoundTranscript(messages) {
+  return messages.map((message) => `${message.speaker}: ${message.content}`).join('\n\n');
+}
+
 function meetingCompleted(result) {
   const summary = result.steps.find((step) => step.id === SUMMARY_ROLE.id);
   return summary?.status === 'completed';
@@ -441,6 +468,10 @@ function meetingCompleted(result) {
 function updateMeetingState(meetingId, status, emit) {
   updateMeetingStatus.run({ id: meetingId, status });
   emit({ type: 'meeting_status', meetingId, status });
+}
+
+function nodeRoleId(node) {
+  return node.step.role || node.step.id;
 }
 
 function normalizeFollowupRound(value) {
@@ -456,7 +487,7 @@ function buildRoundtableWorkflow(roles, topic) {
     id: role.id,
     role: role.id,
     name: role.name,
-    task: `请以${role.name}的专业视角，围绕以下主题发表你的观点和建议：\n\n主题：${topic}\n\n要求：直接针对主题给出专业分析，不要复述你的身份设定。`,
+    task: `请以${role.name}的专业视角，围绕以下主题做第一轮短发言。\n\n主题：${topic}\n\n要求：像真实会议发言，不要写成报告；控制在 180-320 字；结构为「核心判断」「理由」「想追问/提醒其他角色的一点」；不要复述身份设定。`,
     output: `${role.id}_speech`,
     depends_on: undefined,
   }));
@@ -465,11 +496,45 @@ function buildRoundtableWorkflow(roles, topic) {
     name: 'roundtable',
     agents_dir: '.',
     llm: { provider: 'deepseek', model: DEEPSEEK_MODEL, timeout: ROLE_TIMEOUT_MS, retry: 0 },
-    concurrency: 3,
-    steps: [
-      ...roleSteps,
-      buildSummaryStep(roles, topic, roleSteps),
-    ],
+    concurrency: ROUNDTABLE_CONCURRENCY,
+    steps: roleSteps,
+  };
+}
+
+function buildResponseWorkflow(roles, topic, firstRoundMessages) {
+  const transcript = formatRoundTranscript(firstRoundMessages);
+  return {
+    name: 'roundtable-response',
+    agents_dir: '.',
+    llm: { provider: 'deepseek', model: DEEPSEEK_MODEL, timeout: ROLE_TIMEOUT_MS, retry: 0 },
+    concurrency: ROUNDTABLE_CONCURRENCY,
+    steps: roles.map((role) => ({
+      id: `${role.id}_response`,
+      role: role.id,
+      name: role.name,
+      task: `请以${role.name}的专业视角，基于第一轮所有角色发言做第二轮回应。\n\n主题：${topic}\n\n第一轮发言：\n${transcript}\n\n要求：像会议中的追问或补充，控制在 100-180 字；必须点名回应至少一个其他角色的观点；避免重复自己的第一轮内容；不要复述身份设定。`,
+      output: `${role.id}_response`,
+      depends_on: undefined,
+    })),
+  };
+}
+
+function buildSummaryWorkflow(roles, topic, roundMessages) {
+  const roleNames = roles.map((role) => role.name).join('、');
+  const transcript = formatRoundTranscript(roundMessages);
+  return {
+    name: 'roundtable-summary',
+    agents_dir: '.',
+    llm: { provider: 'deepseek', model: DEEPSEEK_MODEL, timeout: ROLE_TIMEOUT_MS, retry: 0 },
+    concurrency: 1,
+    steps: [{
+      id: SUMMARY_ROLE.id,
+      role: SUMMARY_ROLE.id,
+      name: SUMMARY_ROLE.name,
+      task: `以${SUMMARY_ROLE.name}身份发言：请基于完整圆桌内容整理会议总结。\n\n会议主题：${topic}\n\n参与角色：${roleNames}\n\n圆桌发言：\n${transcript}\n\n要求：控制在 300-500 字，输出三段：1. 结论 2. 关键分歧 3. 下一步行动建议。`,
+      output: 'meeting_summary',
+      depends_on: undefined,
+    }],
   };
 }
 
@@ -567,6 +632,7 @@ function createRoundtableConnector(meetingId, meetingTitle, emit, roles) {
         roleName,
         content,
         id: insertResult.lastInsertRowid,
+        playbackDelayMs: role.id === SUMMARY_ROLE.id ? DISCUSSION_DELAY_MS * 2 : DISCUSSION_DELAY_MS,
       });
 
       return result;

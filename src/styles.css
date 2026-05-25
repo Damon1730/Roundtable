@@ -212,6 +212,18 @@ button:disabled {
   background: color-mix(in srgb, var(--role-color, #4f46e5) 10%, #ffffff);
 }
 
+.bubble.streaming .markdown-content::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 1.15em;
+  margin-left: 4px;
+  border-radius: 999px;
+  background: var(--role-color, #4f46e5);
+  vertical-align: -0.18em;
+  animation: cursorBlink 0.85s ease-in-out infinite;
+}
+
 .bubble.active {
   animation: activePulse 1.5s ease-in-out infinite;
 }
@@ -388,5 +400,14 @@ button:disabled {
   40% {
     opacity: 1;
     transform: scale(1);
+  }
+}
+
+@keyframes cursorBlink {
+  0%, 45% {
+    opacity: 1;
+  }
+  46%, 100% {
+    opacity: 0;
   }
 }

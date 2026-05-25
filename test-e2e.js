@@ -177,20 +177,22 @@ async function test2_wsMessageFormat() {
   assert(done.meetingId === meetingId, `done.meetingId正确`);
   assert(done.status === 'done' || done.status === 'failed', `done.status有效: ${done.status}`);
 
-  // 顺序校验：角色speech按roles数组顺序出现
+  // 顺序校验：第一轮按roles数组顺序出现，第二轮再次按roles数组顺序回应
   const speechRoleIds = roleSpeeches.map((s) => s.roleId);
   assert(
-    JSON.stringify(speechRoleIds) === JSON.stringify(['frontend', 'backend', 'tester']),
+    JSON.stringify(speechRoleIds) === JSON.stringify(['frontend', 'backend', 'tester', 'frontend', 'backend', 'tester']),
     `speech顺序正确: ${JSON.stringify(speechRoleIds)}`
   );
 
-  // thinking和speech交替：每个thinking后紧跟同角色的speech
+  // thinking和speech对应：每条角色speech前都出现过同角色thinking
   for (let i = 0; i < roleSpeeches.length; i++) {
     const speechIdx = events.indexOf(roleSpeeches[i]);
-    const prevEvent = events[speechIdx - 1];
+    const priorThinking = events.slice(0, speechIdx).some((event) => (
+      event.type === 'thinking' && event.roleId === roleSpeeches[i].roleId
+    ));
     assert(
-      prevEvent?.type === 'thinking' && prevEvent?.roleId === roleSpeeches[i].roleId,
-      `speech[${i}]前有同角色thinking`
+      priorThinking,
+      `speech[${i}]前出现过同角色thinking`
     );
   }
 }
@@ -269,7 +271,7 @@ async function test4_multiRoleScenarios() {
   const events3 = await eventsPromise3;
   ws3.close();
   const speeches3 = events3.filter((e) => e.type === 'speech' && e.roleId !== 'summary');
-  assert(speeches3.length === 3, `3角色产出3条speech (got ${speeches3.length})`);
+  assert(speeches3.length === 6, `3角色产出两轮共6条speech (got ${speeches3.length})`);
   assert(events3.some((e) => e.type === 'done' && e.status === 'done'), '3角色会议正常结束');
 
   // 4b: 5角色
@@ -297,7 +299,7 @@ async function test4_multiRoleScenarios() {
     assert(false, `5角色被拒绝(不应该): ${error5.message}`);
   } else {
     const speeches5 = events5.filter((e) => e.type === 'speech' && e.roleId !== 'summary');
-    assert(speeches5.length === 5, `5角色产出5条speech (got ${speeches5.length})`);
+    assert(speeches5.length === 10, `5角色产出两轮共10条speech (got ${speeches5.length})`);
     assert(events5.some((e) => e.type === 'done'), '5角色会议正常结束');
   }
 
@@ -322,7 +324,7 @@ async function test4_multiRoleScenarios() {
     assert(false, `10角色被拒绝(不应该): ${error10.message}`);
   } else {
     const speeches10 = events10.filter((e) => e.type === 'speech' && e.roleId !== 'summary');
-    assert(speeches10.length === 10, `10角色产出10条speech (got ${speeches10.length})`);
+    assert(speeches10.length === 20, `10角色产出两轮共20条speech (got ${speeches10.length})`);
     assert(events10.some((e) => e.type === 'done'), '10角色会议正常结束');
   }
 }
@@ -353,7 +355,7 @@ async function test5_mockMode() {
   
   // Mock模式下，speech.content是userMessage的echo
   // userMessage应只包含讨论任务和主题，不应泄露角色system prompt
-  assert(speeches.length === 3, `Mock模式产出3条speech (got ${speeches.length})`);
+  assert(speeches.length === 6, `Mock模式产出两轮共6条speech (got ${speeches.length})`);
   if (speeches.length >= 3) {
     assert(speeches.every((s) => s.content.includes('主题：Mock测试')), 'Mock: speech包含讨论主题');
     assert(speeches.every((s) => !s.content.includes('特定内容')), 'Mock: speech不含原始prompt');
@@ -511,7 +513,7 @@ async function main() {
   console.log(`\n  总计: ${passed + failed} | 通过: ${passed} | 失败: ${failed}`);
   console.log('========================================');
 
-  process.exit(failed > 0 ? 1 : 0);
+  process.exitCode = failed > 0 ? 1 : 0;
 }
 
 main();
