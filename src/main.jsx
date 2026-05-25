@@ -110,10 +110,10 @@ function App() {
 
   useEffect(() => {
     localStorage.setItem('activeMeetingId', meetingId);
-    if (activeHistory) {
+    if (activeHistory && !isRunning && !playbackActiveRef.current && playbackQueueRef.current.length === 0) {
       loadMeeting(meetingId);
     }
-  }, [meetingId, activeHistory]);
+  }, [meetingId, activeHistory, isRunning]);
 
   useEffect(() => {
     loadHistory();

@@ -596,15 +596,37 @@ function createMockConnector() {
       if (systemPrompt.includes('[[timeout]]') || userMessage.includes('[[timeout]]')) {
         await new Promise(() => {});
       }
+      const roleName = currentRoleName(userMessage);
+      const topic = extractTopic(userMessage);
+      const content = roleName === SUMMARY_ROLE.name
+        ? createMockSummary(topic, userMessage)
+        : createMockSpeech(roleName, topic, userMessage);
       return {
-        content: userMessage,
+        content,
         usage: {
           input_tokens: userMessage.length,
-          output_tokens: userMessage.length,
+          output_tokens: content.length,
         },
       };
     },
   };
+}
+
+function extractTopic(userMessage) {
+  const match = userMessage.match(/(?:主题|会议主题)：(.+)/);
+  return match ? match[1].trim() : '当前议题';
+}
+
+function createMockSpeech(roleName, topic, userMessage) {
+  const isResponse = userMessage.includes('第二轮回应') || userMessage.includes('第一轮发言：');
+  if (isResponse) {
+    return `我先回应前面几位的观点：这个问题不能只看单点动作，必须把风险、成本和执行节奏放在一起评估。围绕「${topic}」，我的补充是先设定清晰边界，再选择最小阻力路径，避免为了短期目标留下后续纠纷。`;
+  }
+  return `核心判断：围绕「${topic}」，${roleName}建议先把目标拆成可执行、可验证、可留痕的方案。\n\n理由：这类问题通常不是单纯做一个动作，而是牵涉成本、风险、沟通和后续影响。如果流程不清楚，短期看似省事，后面可能放大代价。\n\n想提醒其他角色的一点：请重点补充风险边界和替代方案。`;
+}
+
+function createMockSummary(topic, userMessage) {
+  return `1. 结论\n围绕「${topic}」，本轮圆桌更倾向于先做结构化评估，再推进低风险动作，而不是直接追求一步到位。\n\n2. 关键分歧\n分歧主要在执行速度和风险控制之间：一方关注尽快降低成本，另一方关注流程、合规和组织影响。\n\n3. 下一步行动建议\n先列出可替代方案、关键风险点和必要留痕材料，再决定具体执行路径。`;
 }
 
 function createRoundtableConnector(meetingId, meetingTitle, emit, roles) {
@@ -669,12 +691,12 @@ async function selectRoles(topic) {
   }
 
   if (process.env.ROUNDTABLE_MOCK_LLM === '1') {
-    return catalog.slice(0, 3).map((role) => ({
+    return selectMockRoles(catalog, topic).map((role) => ({
       id: slugify(`${role.category}-${role.filename.replace(/\.md$/i, '')}`),
       category: role.category,
       filename: role.filename,
       name: role.name,
-      reason: 'mock role selection',
+      reason: 'mock keyword role selection',
       prompt: readFileSync(role.path, 'utf8'),
     }));
   }
@@ -727,6 +749,52 @@ async function selectRoles(topic) {
   }
 
   return roles;
+}
+
+function selectMockRoles(catalog, topic) {
+  const text = String(topic || '');
+  const keywordGroups = [
+    {
+      test: /裁员|劳动|员工|雇佣|解雇|离职|赔偿|社保|公司|合规|法律|合同|风险/,
+      keywords: ['法务合规员', '法律文书审查专家', '合同审查专家', 'HR 入职管理专家', '招聘运营专家', '企业风险评估师', '财务分析师', '财务追踪员'],
+    },
+    {
+      test: /微信|小程序|移动端|H5|前端|后端|技术|架构|部署/,
+      keywords: ['微信小程序开发者', '前端开发者', '后端架构师', '安全工程师', 'UX 架构师', 'UI 设计师', '合同审查专家'],
+    },
+    {
+      test: /融资|投资|商业|增长|市场|收入|成本|财务/,
+      keywords: ['投资研究员', '财务分析师', '增长黑客', '市场研究员', '企业风险评估师', '财务预测分析师'],
+    },
+  ];
+
+  const matchedGroup = keywordGroups.find((group) => group.test.test(text));
+  const preferred = matchedGroup?.keywords || ['企业风险评估师', '财务分析师', '法务合规员'];
+  const selected = [];
+  const seen = new Set();
+
+  for (const keyword of preferred) {
+    const role = catalog.find((item) => item.name.includes(keyword) || item.description.includes(keyword) || item.filename.includes(keyword));
+    if (role && !seen.has(role.path)) {
+      selected.push(role);
+      seen.add(role.path);
+    }
+    if (selected.length >= 5) {
+      break;
+    }
+  }
+
+  for (const role of catalog) {
+    if (selected.length >= 3) {
+      break;
+    }
+    if (!seen.has(role.path)) {
+      selected.push(role);
+      seen.add(role.path);
+    }
+  }
+
+  return selected.slice(0, 5);
 }
 
 function loadRoleCatalog() {

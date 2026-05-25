@@ -357,8 +357,9 @@ async function test5_mockMode() {
   // userMessage应只包含讨论任务和主题，不应泄露角色system prompt
   assert(speeches.length === 6, `Mock模式产出两轮共6条speech (got ${speeches.length})`);
   if (speeches.length >= 3) {
-    assert(speeches.every((s) => s.content.includes('主题：Mock测试')), 'Mock: speech包含讨论主题');
+    assert(speeches.every((s) => s.content.includes('Mock测试')), 'Mock: speech包含讨论主题');
     assert(speeches.every((s) => !s.content.includes('特定内容')), 'Mock: speech不含原始prompt');
+    assert(speeches.every((s) => !s.content.includes('请以')), 'Mock: speech不回显任务prompt');
   }
 
   // Health endpoint
