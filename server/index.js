@@ -14,9 +14,9 @@ const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
 const AGENTS_DIR = process.env.AGENTS_DIR || resolveAgentsDir();
 const MAX_FOLLOWUP_ROUNDS = 2;
 const INITIAL_DISCUSSION_ROUNDS = 2;
-const SUMMARY_ROLE = { id: 'summary', name: '会议总结', prompt: '总结会议结论、分歧和行动建议。' };
 const ROUNDTABLE_CONCURRENCY = Number(process.env.ROUNDTABLE_CONCURRENCY || 3);
 const DISCUSSION_DELAY_MS = Number(process.env.ROUNDTABLE_DISCUSSION_DELAY_MS || 900);
+const SUMMARY_ROLE = { id: 'summary', name: '会议总结', prompt: '总结会议结论、分歧和行动建议。' };
 
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -36,6 +36,19 @@ db.exec(`
     speaker TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS meeting_roles (
+    meeting_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    category TEXT,
+    filename TEXT,
+    reason TEXT,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (meeting_id, role_id),
     FOREIGN KEY (meeting_id) REFERENCES meetings(id)
   );
 `);
@@ -96,6 +109,37 @@ const listMessagesByMeeting = db.prepare(`
   WHERE meeting_id = ?
   ORDER BY id ASC
 `);
+const upsertMeetingRole = db.prepare(`
+  INSERT INTO meeting_roles (meeting_id, role_id, name, prompt, category, filename, reason, position)
+  VALUES (@meetingId, @id, @name, @prompt, @category, @filename, @reason, @position)
+  ON CONFLICT(meeting_id, role_id) DO UPDATE SET
+    name = excluded.name,
+    prompt = excluded.prompt,
+    category = excluded.category,
+    filename = excluded.filename,
+    reason = excluded.reason,
+    position = excluded.position
+`);
+const listMeetingRoles = db.prepare(`
+  SELECT role_id AS id, name, prompt, category, filename, reason
+  FROM meeting_roles
+  WHERE meeting_id = ?
+  ORDER BY position ASC
+`);
+const saveMeetingRoles = db.transaction((meetingId, roles) => {
+  roles.forEach((role, index) => {
+    upsertMeetingRole.run({
+      meetingId,
+      id: role.id,
+      name: role.name,
+      prompt: role.prompt || '',
+      category: role.category || null,
+      filename: role.filename || null,
+      reason: role.reason || null,
+      position: index,
+    });
+  });
+});
 
 const DEFAULT_ROLES = [
   { id: 'frontend', name: '前端', prompt: '从前端体验和实现复杂度角度发言。' },
@@ -205,7 +249,7 @@ async function handleFollowupRequest(req, res, meetingId) {
     }
 
     const payload = await readJsonBody(req);
-    const roles = normalizeRoles(payload.roles || DEFAULT_ROLES);
+    const roles = resolveFollowupRoles(meetingId, payload.roles);
     const question = normalizeRequiredString(payload.question || payload.topic, 'question');
     const meetingTitle = normalizeOptionalString(payload.meetingTitle) || meeting.title || null;
     const messageCount = countRoleMessagesByMeeting.get(meetingId, SUMMARY_ROLE.name).count;
@@ -276,7 +320,7 @@ async function runRoundtable(ws, payload) {
   const emit = (payload) => sendJson(ws, payload);
 
   if (!Array.isArray(payload.roles)) {
-    sendJson(ws, {
+    emit({
       type: 'roles_selected',
       meetingId,
       roles: roles.map(({ category, filename, name, reason }) => ({ category, filename, name, reason })),
@@ -284,9 +328,9 @@ async function runRoundtable(ws, payload) {
   }
 
   ensureMeeting.run({ id: meetingId, title: meetingTitle, status: 'pending' });
-
-  const agentsDir = ensureAgentFiles([...roles, SUMMARY_ROLE]);
+  saveMeetingRoles(meetingId, roles);
   const connector = createRoundtableConnector(meetingId, meetingTitle, emit, [...roles, SUMMARY_ROLE]);
+  const agentsDir = ensureAgentFiles([...roles, SUMMARY_ROLE]);
   const runStage = (workflow, stageRoles = roles) => {
     const dag = buildDAG(workflow);
     hydrateDagAgents(dag, [...stageRoles, SUMMARY_ROLE]);
@@ -322,22 +366,15 @@ async function runRoundtable(ws, payload) {
   };
 
   updateMeetingState(meetingId, 'running', emit);
-  const firstRoundResult = await runStage(buildRoundtableWorkflow(roles, topic));
+  await runStage(buildRoundtableWorkflow(roles, topic));
   const firstRoundMessages = listRoundMessages(meetingId);
-  let responseResult = { success: true, steps: [] };
   if (firstRoundMessages.length > 1) {
     const responseRoles = roles.filter((role) => firstRoundMessages.some((message) => message.speaker === role.name));
-    responseResult = await runStage(
-      buildResponseWorkflow(responseRoles, topic, firstRoundMessages),
-      responseRoles,
-    );
+    await runStage(buildResponseWorkflow(responseRoles, topic, firstRoundMessages), responseRoles);
   }
-  const summaryResult = await runStage(
-    buildSummaryWorkflow(roles, topic, listRoundMessages(meetingId)),
-    roles,
-  );
+  const result = await runStage(buildSummaryWorkflow(roles, topic, listRoundMessages(meetingId)), roles);
 
-  if (meetingCompleted(summaryResult)) {
+  if (meetingCompleted(result)) {
     updateMeetingState(meetingId, 'done', emit);
     emit({ type: 'done', meetingId, status: 'done' });
   } else {
@@ -350,7 +387,7 @@ async function runFollowup(ws, payload) {
   const meetingId = normalizeRequiredString(payload.meetingId, 'meetingId');
   const meetingTitle = normalizeOptionalString(payload.meetingTitle);
   const topic = normalizeRequiredString(payload.topic, 'topic');
-  const roles = normalizeRoles(payload.roles || DEFAULT_ROLES);
+  const roles = resolveFollowupRoles(meetingId, payload.roles);
   const round = normalizeFollowupRound(payload.round);
 
   const meeting = getMeeting.get(meetingId);
@@ -427,11 +464,12 @@ async function runFollowup(ws, payload) {
 
 function buildFollowupWorkflow(roles, topic, contextMessages, round) {
   const contextText = formatMeetingContext(contextMessages);
+  const focus = topicFocusInstruction(topic);
   const roleSteps = roles.map((role) => ({
     id: role.id,
     role: role.id,
     name: role.name,
-    task: `请以${role.name}的专业视角，基于以下会议上下文回答第 ${round} 轮追问。\n\n会议主题：${topic}\n\n上下文：\n${contextText}\n\n要求：像圆桌会议中的一次短发言，控制在 120-220 字；先回应前面观点，再给出一个新的判断或补充；不要复述身份设定。`,
+    task: `请以${role.name}的专业视角，基于以下会议上下文回答第 ${round} 轮追问。\n\n本次唯一议题：${topic}\n\n上下文：\n${contextText}\n\n${focus}\n\n要求：第一句必须直接回应本次唯一议题；像圆桌会议中的一次短发言，控制在 120-220 字；先回应前面观点，再给出一个新的判断或补充；不要复述身份设定；不要编造与议题无关的公司数据、审计数据或案例。`,
     output: `${role.id}_followup_${round}`,
     depends_on: undefined,
   }));
@@ -470,10 +508,6 @@ function updateMeetingState(meetingId, status, emit) {
   emit({ type: 'meeting_status', meetingId, status });
 }
 
-function nodeRoleId(node) {
-  return node.step.role || node.step.id;
-}
-
 function normalizeFollowupRound(value) {
   const round = Number(value || 1);
   if (!Number.isInteger(round) || round < 1 || round > MAX_FOLLOWUP_ROUNDS) {
@@ -482,12 +516,17 @@ function normalizeFollowupRound(value) {
   return round;
 }
 
+function nodeRoleId(node) {
+  return node.step.role || node.step.id;
+}
+
 function buildRoundtableWorkflow(roles, topic) {
+  const focus = topicFocusInstruction(topic);
   const roleSteps = roles.map((role) => ({
     id: role.id,
     role: role.id,
     name: role.name,
-    task: `请以${role.name}的专业视角，围绕以下主题做第一轮短发言。\n\n主题：${topic}\n\n要求：像真实会议发言，不要写成报告；控制在 180-320 字；结构为「核心判断」「理由」「想追问/提醒其他角色的一点」；不要复述身份设定。`,
+    task: `请以${role.name}的专业视角，围绕以下主题做第一轮短发言。\n\n本次唯一议题：${topic}\n\n${focus}\n\n要求：第一句必须直接回答本次唯一议题；像真实会议发言，不要写成报告；控制在 180-320 字；结构为「核心判断」「理由」「想追问/提醒其他角色的一点」；不要复述身份设定；不要编造与议题无关的公司数据、审计数据或案例。`,
     output: `${role.id}_speech`,
     depends_on: undefined,
   }));
@@ -503,6 +542,7 @@ function buildRoundtableWorkflow(roles, topic) {
 
 function buildResponseWorkflow(roles, topic, firstRoundMessages) {
   const transcript = formatRoundTranscript(firstRoundMessages);
+  const focus = topicFocusInstruction(topic);
   return {
     name: 'roundtable-response',
     agents_dir: '.',
@@ -512,7 +552,7 @@ function buildResponseWorkflow(roles, topic, firstRoundMessages) {
       id: `${role.id}_response`,
       role: role.id,
       name: role.name,
-      task: `请以${role.name}的专业视角，基于第一轮所有角色发言做第二轮回应。\n\n主题：${topic}\n\n第一轮发言：\n${transcript}\n\n要求：像会议中的追问或补充，控制在 100-180 字；必须点名回应至少一个其他角色的观点；避免重复自己的第一轮内容；不要复述身份设定。`,
+      task: `请以${role.name}的专业视角，基于第一轮所有角色发言做第二轮回应。\n\n本次唯一议题：${topic}\n\n第一轮发言：\n${transcript}\n\n${focus}\n\n要求：第一句必须继续扣住本次唯一议题；像会议中的追问或补充，控制在 100-180 字；必须点名回应至少一个其他角色的观点；避免重复自己的第一轮内容；不要复述身份设定；不要编造与议题无关的公司数据、审计数据或案例。`,
       output: `${role.id}_response`,
       depends_on: undefined,
     })),
@@ -536,6 +576,14 @@ function buildSummaryWorkflow(roles, topic, roundMessages) {
       depends_on: undefined,
     }],
   };
+}
+
+function topicFocusInstruction(topic) {
+  const text = String(topic || '');
+  if (/裁员|劳动|员工|雇佣|解雇|离职|赔偿|社保|公司|合规|法律|合同|风险/.test(text)) {
+    return '议题约束：这是一道劳动用工/裁员合规问题。发言必须围绕劳动合同解除、经济补偿或赔偿、裁员程序、沟通方案、证据留痕、社保工资结算、合规审批和争议风险展开。不要转去讨论产品、营销、采购、审计、增长或技术实现。';
+  }
+  return '议题约束：只讨论用户给出的主题，不要转去讨论角色设定、通用方法论或与主题无关的案例。';
 }
 
 function buildSummaryStep(roles, topic, roleSteps, contextText = '') {
@@ -599,7 +647,7 @@ function createMockConnector() {
       const roleName = currentRoleName(userMessage);
       const topic = extractTopic(userMessage);
       const content = roleName === SUMMARY_ROLE.name
-        ? createMockSummary(topic, userMessage)
+        ? createMockSummary(topic)
         : createMockSpeech(roleName, topic, userMessage);
       return {
         content,
@@ -620,13 +668,13 @@ function extractTopic(userMessage) {
 function createMockSpeech(roleName, topic, userMessage) {
   const isResponse = userMessage.includes('第二轮回应') || userMessage.includes('第一轮发言：');
   if (isResponse) {
-    return `我先回应前面几位的观点：这个问题不能只看单点动作，必须把风险、成本和执行节奏放在一起评估。围绕「${topic}」，我的补充是先设定清晰边界，再选择最小阻力路径，避免为了短期目标留下后续纠纷。`;
+    return `我先回应前面几位的观点：围绕「${topic}」，这个问题不能只看单点动作，必须把风险、成本和执行节奏放在一起评估。我的补充是先设定清晰边界，再选择阻力最小、后患最少的路径。`;
   }
-  return `核心判断：围绕「${topic}」，${roleName}建议先把目标拆成可执行、可验证、可留痕的方案。\n\n理由：这类问题通常不是单纯做一个动作，而是牵涉成本、风险、沟通和后续影响。如果流程不清楚，短期看似省事，后面可能放大代价。\n\n想提醒其他角色的一点：请重点补充风险边界和替代方案。`;
+  return `核心判断：围绕「${topic}」，${roleName}建议先把目标拆成可执行、可验证、可留痕的方案。\n\n理由：这类问题通常牵涉成本、风险、沟通和后续影响。如果流程不清楚，短期看似省事，后面可能放大代价。\n\n想提醒其他角色的一点：请重点补充风险边界和替代方案。`;
 }
 
-function createMockSummary(topic, userMessage) {
-  return `1. 结论\n围绕「${topic}」，本轮圆桌更倾向于先做结构化评估，再推进低风险动作，而不是直接追求一步到位。\n\n2. 关键分歧\n分歧主要在执行速度和风险控制之间：一方关注尽快降低成本，另一方关注流程、合规和组织影响。\n\n3. 下一步行动建议\n先列出可替代方案、关键风险点和必要留痕材料，再决定具体执行路径。`;
+function createMockSummary(topic) {
+  return `1. 结论\n围绕「${topic}」，本轮圆桌更倾向于先做结构化评估，再推进低风险动作，而不是直接一步到位。\n\n2. 关键分歧\n分歧主要在执行速度和风险控制之间：一方关注尽快达成目标，另一方关注流程、合规和组织影响。\n\n3. 下一步行动建议\n先列出可替代方案、关键风险点和必要留痕材料，再决定具体执行路径。`;
 }
 
 function createRoundtableConnector(meetingId, meetingTitle, emit, roles) {
@@ -684,6 +732,24 @@ function roleById(roles, id) {
   return roles.find((role) => role.id === id) || { id, name: id };
 }
 
+function resolveFollowupRoles(meetingId, payloadRoles) {
+  if (Array.isArray(payloadRoles)) {
+    return normalizeRoles(payloadRoles);
+  }
+
+  const savedRoles = listMeetingRoles.all(meetingId);
+  if (savedRoles.length > 0) {
+    return savedRoles.map((role) => ({
+      ...role,
+      category: role.category || undefined,
+      filename: role.filename || undefined,
+      reason: role.reason || undefined,
+    }));
+  }
+
+  throw new Error('meeting_roles_not_found');
+}
+
 async function selectRoles(topic) {
   const catalog = loadRoleCatalog();
   if (catalog.length === 0) {
@@ -711,44 +777,107 @@ async function selectRoles(topic) {
     max_tokens: 2048,
   });
 
-  const selected = parseSelectedRoles(result.content);
-  const roleByKey = new Map(catalog.map((role) => [`${role.category}/${role.filename}`, role]));
+  let selected = [];
+  try {
+    selected = parseSelectedRoles(result.content);
+  } catch {
+    selected = [];
+  }
+  const roles = materializeSelectedRoles(selected, catalog);
+
+  const guardedRoles = guardSelectedRoles(catalog, topic, roles);
+  if (guardedRoles.length >= 3 && guardedRoles.length <= 10) {
+    return guardedRoles;
+  }
+
+  return selectMockRoles(catalog, topic).map((role) => ({
+    id: slugify(`${role.category}-${role.filename.replace(/\.md$/i, '')}`),
+    category: role.category,
+    filename: role.filename,
+    name: role.name,
+    reason: 'keyword fallback role selection',
+    prompt: readFileSync(role.path, 'utf8'),
+  }));
+}
+
+function guardSelectedRoles(catalog, topic, roles) {
+  const text = String(topic || '');
+  if (!/裁员|劳动|员工|雇佣|解雇|离职|赔偿|社保|公司|合规|法律|合同|风险/.test(text)) {
+    return roles;
+  }
+
+  const relevant = roles.filter((role) => /法务|法律|合同|HR|招聘|绩效|风险|财务/.test(
+    `${role.name}${role.category || ''}${role.filename || ''}`,
+  ));
+  if (relevant.length >= 3) {
+    return roles;
+  }
+
+  return selectMockRoles(catalog, topic).map((role) => ({
+    id: slugify(`${role.category}-${role.filename.replace(/\.md$/i, '')}`),
+    category: role.category,
+    filename: role.filename,
+    name: role.name,
+    reason: 'topic guard role selection',
+    prompt: readFileSync(role.path, 'utf8'),
+  }));
+}
+
+function materializeSelectedRoles(selected, catalog) {
   const roles = [];
   const seen = new Set();
 
   for (const item of selected) {
-    const category = normalizeOptionalString(item.category);
-    const filename = normalizeOptionalString(item.filename);
-    if (!category || !filename) {
+    const catalogRole = findCatalogRole(catalog, item);
+    if (!catalogRole || seen.has(catalogRole.path)) {
       continue;
     }
 
-    const key = `${category}/${filename}`;
-    if (seen.has(key)) {
-      continue;
-    }
-
-    const catalogRole = roleByKey.get(key);
-    if (!catalogRole) {
-      continue;
-    }
-
-    seen.add(key);
+    seen.add(catalogRole.path);
     roles.push({
-      id: slugify(`${category}-${filename.replace(/\.md$/i, '')}`),
-      category,
-      filename,
+      id: slugify(`${catalogRole.category}-${catalogRole.filename.replace(/\.md$/i, '')}`),
+      category: catalogRole.category,
+      filename: catalogRole.filename,
       name: catalogRole.name,
       reason: normalizeOptionalString(item.reason),
       prompt: readFileSync(catalogRole.path, 'utf8'),
     });
   }
 
-  if (roles.length < 3 || roles.length > 10) {
-    throw new Error('DeepSeek role selection must return 3 to 10 valid roles');
+  return roles;
+}
+
+function findCatalogRole(catalog, item) {
+  const category = normalizeOptionalString(item.category);
+  const filename = normalizeOptionalString(item.filename);
+  const name = normalizeOptionalString(item.name);
+  const id = normalizeOptionalString(item.id || item.agentId || item.agent_id);
+  const candidates = [filename, id].filter(Boolean).map((value) => value.replace(/\.md$/i, ''));
+
+  if (category && filename) {
+    const exactKey = `${category}/${filename}`;
+    const role = catalog.find((entry) => `${entry.category}/${entry.filename}` === exactKey);
+    if (role) {
+      return role;
+    }
   }
 
-  return roles;
+  for (const candidate of candidates) {
+    const role = catalog.find((entry) => (
+      entry.filename.replace(/\.md$/i, '') === candidate
+      || basename(entry.filename, '.md') === candidate
+    ));
+    if (role) {
+      return role;
+    }
+  }
+
+  if (name) {
+    return catalog.find((entry) => entry.name === name)
+      || catalog.find((entry) => entry.name.includes(name) || name.includes(entry.name));
+  }
+
+  return null;
 }
 
 function selectMockRoles(catalog, topic) {
@@ -774,7 +903,7 @@ function selectMockRoles(catalog, topic) {
   const seen = new Set();
 
   for (const keyword of preferred) {
-    const role = catalog.find((item) => item.name.includes(keyword) || item.description.includes(keyword) || item.filename.includes(keyword));
+    const role = findPreferredRole(catalog, keyword);
     if (role && !seen.has(role.path)) {
       selected.push(role);
       seen.add(role.path);
@@ -795,6 +924,14 @@ function selectMockRoles(catalog, topic) {
   }
 
   return selected.slice(0, 5);
+}
+
+function findPreferredRole(catalog, keyword) {
+  const normalizedKeyword = keyword.replace(/\s+/g, '').toLowerCase();
+  return catalog.find((item) => item.name.replace(/\s+/g, '').includes(normalizedKeyword))
+    || catalog.find((item) => item.filename.replace(/\.md$/i, '').toLowerCase().includes(normalizedKeyword))
+    || catalog.find((item) => item.description.replace(/\s+/g, '').includes(normalizedKeyword))
+    || catalog.find((item) => item.name.includes(keyword) || item.description.includes(keyword) || item.filename.includes(keyword));
 }
 
 function loadRoleCatalog() {
@@ -881,7 +1018,7 @@ function parseSelectedRoles(content) {
 
 function resolveAgentsDir() {
   const local = join(process.cwd(), 'agency-agents');
-  if (existsSync(local)) {
+  if (existsSync(join(local, 'AGENT-LIST.md'))) {
     return local;
   }
 

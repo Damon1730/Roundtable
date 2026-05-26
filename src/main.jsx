@@ -29,6 +29,7 @@ function App() {
   const playbackTimersRef = useRef([]);
   const displayedMessageIdsRef = useRef(new Set());
   const serverDoneRef = useRef(false);
+  const liveMeetingRef = useRef(null);
 
   const handleSocketEvent = useCallback((event) => {
     if (event.type === 'thinking') {
@@ -110,7 +111,7 @@ function App() {
 
   useEffect(() => {
     localStorage.setItem('activeMeetingId', meetingId);
-    if (activeHistory && !isRunning && !playbackActiveRef.current && playbackQueueRef.current.length === 0) {
+    if (activeHistory && liveMeetingRef.current !== meetingId && !isRunning && !playbackActiveRef.current && playbackQueueRef.current.length === 0) {
       loadMeeting(meetingId);
     }
   }, [meetingId, activeHistory, isRunning]);
@@ -219,7 +220,6 @@ function App() {
     playbackQueueRef.current = [];
     playbackActiveRef.current = false;
     serverDoneRef.current = false;
-    displayedMessageIdsRef.current = new Set();
     for (const timer of playbackTimersRef.current) {
       window.clearTimeout(timer);
     }
@@ -233,6 +233,7 @@ function App() {
     setIsRunning(false);
     runLockRef.current = false;
     serverDoneRef.current = false;
+    liveMeetingRef.current = null;
   }
 
   function startMeeting() {
@@ -258,6 +259,7 @@ function App() {
     setMeetingTitle(title);
     clearPlayback();
     displayedMessageIdsRef.current = new Set();
+    liveMeetingRef.current = meetingId;
     setMessages([]);
     setThinkingRole(null);
     setIsRunning(true);
@@ -271,6 +273,7 @@ function App() {
     runLockRef.current = false;
     clearPlayback();
     displayedMessageIdsRef.current = new Set();
+    liveMeetingRef.current = null;
     setMeetingId(createMeetingId());
     setMeetingTitle('未命名圆桌');
     setMessages([]);
@@ -285,6 +288,7 @@ function App() {
     runLockRef.current = false;
     clearPlayback();
     displayedMessageIdsRef.current = new Set();
+    liveMeetingRef.current = null;
     setMeetingId(id);
     setThinkingRole(null);
     setIsRunning(false);

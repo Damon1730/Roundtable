@@ -88,13 +88,13 @@ async function test1_fullFlow() {
   }));
   const events = await eventsPromise;
 
-  // 预期事件序列：meeting_status(running) → [thinking, speech]*3 → thinking(summary), speech(summary) → meeting_status(done) → done
+  // 预期事件序列：meeting_status(running) → 两轮角色speech → thinking(summary), speech(summary) → meeting_status(done) → done
   const typeSequence = events.map((e) => e.type);
   
   // 验证关键事件存在
   assert(typeSequence.includes('meeting_status'), '有meeting_status事件');
   assert(typeSequence.filter((t) => t === 'thinking').length >= 3, '至少3个thinking事件');
-  assert(typeSequence.filter((t) => t === 'speech').length >= 3, '至少3个speech事件（含总结）');
+  assert(typeSequence.filter((t) => t === 'speech').length >= 7, '至少7个speech事件（两轮角色+总结）');
   assert(typeSequence[typeSequence.length - 1] === 'done', '最后一个事件是done');
 
   const done = events.find((e) => e.type === 'done');
@@ -177,14 +177,14 @@ async function test2_wsMessageFormat() {
   assert(done.meetingId === meetingId, `done.meetingId正确`);
   assert(done.status === 'done' || done.status === 'failed', `done.status有效: ${done.status}`);
 
-  // 顺序校验：第一轮按roles数组顺序出现，第二轮再次按roles数组顺序回应
+  // 顺序校验：角色speech按roles数组顺序出现
   const speechRoleIds = roleSpeeches.map((s) => s.roleId);
   assert(
     JSON.stringify(speechRoleIds) === JSON.stringify(['frontend', 'backend', 'tester', 'frontend', 'backend', 'tester']),
     `speech顺序正确: ${JSON.stringify(speechRoleIds)}`
   );
 
-  // thinking和speech对应：每条角色speech前都出现过同角色thinking
+  // thinking和speech对应：每条speech前都出现过同角色thinking
   for (let i = 0; i < roleSpeeches.length; i++) {
     const speechIdx = events.indexOf(roleSpeeches[i]);
     const priorThinking = events.slice(0, speechIdx).some((event) => (
@@ -353,14 +353,28 @@ async function test5_mockMode() {
 
   const speeches = events.filter((e) => e.type === 'speech' && e.roleId !== 'summary');
   
-  // Mock模式下，speech.content是userMessage的echo
-  // userMessage应只包含讨论任务和主题，不应泄露角色system prompt
   assert(speeches.length === 6, `Mock模式产出两轮共6条speech (got ${speeches.length})`);
   if (speeches.length >= 3) {
     assert(speeches.every((s) => s.content.includes('Mock测试')), 'Mock: speech包含讨论主题');
     assert(speeches.every((s) => !s.content.includes('特定内容')), 'Mock: speech不含原始prompt');
     assert(speeches.every((s) => !s.content.includes('请以')), 'Mock: speech不回显任务prompt');
   }
+
+  const legalWs = await connectWs();
+  const legalMeetingId = `e2e-legal-roles-${Date.now()}`;
+  const legalEventsPromise = collectEvents(legalWs, (e) => e.type === 'roles_selected', 30000);
+  legalWs.send(JSON.stringify({
+    action: 'run_roundtable',
+    meetingId: legalMeetingId,
+    meetingTitle: '法律选角验证',
+    topic: '公司裁员如何规避劳动法律风险',
+  }));
+  const legalEvents = await legalEventsPromise;
+  legalWs.close();
+  const selected = legalEvents.find((e) => e.type === 'roles_selected')?.roles || [];
+  const selectedNames = selected.map((role) => role.name).join('、');
+  assert(selected.length >= 3, `法律主题自动选出>=3个角色 (got ${selected.length})`);
+  assert(!/前端|后端|测试/.test(selectedNames), `法律主题不选择POC固定技术角色: ${selectedNames}`);
 
   // Health endpoint
   const health = await fetchJson('/health');
@@ -394,8 +408,8 @@ async function test6_persistenceAndReconnect() {
   // 断线后通过HTTP API获取历史
   const detail = await fetchJson(`/api/meeting/${encodeURIComponent(meetingId)}`);
   assert(detail.status === 200, 'GET /api/meeting/:id 200');
-  // 3角色 + 1总结 = 4条消息
-  assert(detail.body.messages.length >= 3, `历史消息数>=3 (got ${detail.body.messages.length})`);
+  // 3角色两轮 + 1总结 = 7条消息
+  assert(detail.body.messages.length >= 7, `历史消息数>=7 (got ${detail.body.messages.length})`);
   assert(detail.body.meeting.title === '持久化测试', '会议标题持久化正确');
   assert(detail.body.meeting.status === 'done', '会议状态为done');
 
