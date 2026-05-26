@@ -6,7 +6,7 @@ import './styles.css';
 const ROLE_EMOJIS = ['🧠', '🧩', '🚀'];
 const ROLE_COLORS = ['#6d5dfc', '#0ea5e9', '#f97316', '#10b981', '#e11d48', '#8b5cf6'];
 const CHAT_PLAYBACK_DELAY_MS = 650;
-const TYPEWRITER_INTERVAL_MS = 45;
+const TYPEWRITER_INTERVAL_MS = 60;
 const TYPEWRITER_CHUNK_SIZE = 1;
 
 function createMeetingId() {
