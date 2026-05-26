@@ -5,9 +5,9 @@ import './styles.css';
 
 const ROLE_EMOJIS = ['🧠', '🧩', '🚀'];
 const ROLE_COLORS = ['#6d5dfc', '#0ea5e9', '#f97316', '#10b981', '#e11d48', '#8b5cf6'];
-const CHAT_PLAYBACK_DELAY_MS = 900;
-const TYPEWRITER_INTERVAL_MS = 12;
-const TYPEWRITER_CHUNK_SIZE = 3;
+const CHAT_PLAYBACK_DELAY_MS = 650;
+const TYPEWRITER_INTERVAL_MS = 45;
+const TYPEWRITER_CHUNK_SIZE = 1;
 
 function createMeetingId() {
   return `meeting-${Date.now()}`;
@@ -38,16 +38,13 @@ function App() {
     }
 
     if (event.type === 'roles_selected') {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `roles-selected-${Date.now()}`,
-          speaker: '系统',
-          roleId: 'system',
-          content: formatSelectedRoles(event.roles),
-          type: 'system',
-        },
-      ]);
+      queuePlayback({
+        id: `roles-selected-${event.meetingId}`,
+        speaker: '系统',
+        roleId: 'system',
+        content: formatSelectedRoles(event.roles),
+        type: 'system',
+      }, 250);
       return;
     }
 
@@ -233,7 +230,6 @@ function App() {
     setIsRunning(false);
     runLockRef.current = false;
     serverDoneRef.current = false;
-    liveMeetingRef.current = null;
   }
 
   function startMeeting() {

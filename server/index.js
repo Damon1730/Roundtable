@@ -661,7 +661,7 @@ function createMockConnector() {
 }
 
 function extractTopic(userMessage) {
-  const match = userMessage.match(/(?:主题|会议主题)：(.+)/);
+  const match = userMessage.match(/(?:本次唯一议题|主题|会议主题)：(.+)/);
   return match ? match[1].trim() : '当前议题';
 }
 
