@@ -5,6 +5,9 @@ import './styles.css';
 
 const ROLE_EMOJIS = ['🧠', '🧩', '🚀'];
 const ROLE_COLORS = ['#6d5dfc', '#0ea5e9', '#f97316', '#10b981', '#e11d48', '#8b5cf6'];
+const CHAT_PLAYBACK_DELAY_MS = 650;
+const TYPEWRITER_INTERVAL_MS = 60;
+const TYPEWRITER_CHUNK_SIZE = 1;
 
 function createMeetingId() {
   return `meeting-${Date.now()}`;
@@ -21,6 +24,12 @@ function App() {
   const [notice, setNotice] = useState('');
   const runLockRef = useRef(false);
   const loadSeqRef = useRef(0);
+  const playbackQueueRef = useRef([]);
+  const playbackActiveRef = useRef(false);
+  const playbackTimersRef = useRef([]);
+  const displayedMessageIdsRef = useRef(new Set());
+  const serverDoneRef = useRef(false);
+  const liveMeetingRef = useRef(null);
 
   const handleSocketEvent = useCallback((event) => {
     if (event.type === 'thinking') {
@@ -29,27 +38,19 @@ function App() {
     }
 
     if (event.type === 'roles_selected') {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `roles-selected-${Date.now()}`,
-          speaker: '系统',
-          roleId: 'system',
-          content: formatSelectedRoles(event.roles),
-          type: 'system',
-        },
-      ]);
+      queuePlayback({
+        id: `roles-selected-${event.meetingId}`,
+        speaker: '系统',
+        roleId: 'system',
+        content: formatSelectedRoles(event.roles),
+        type: 'system',
+      }, 250);
       return;
     }
 
     if (event.type === 'speech') {
       setThinkingRole(null);
-      setMessages((prev) => {
-        if (prev.some((message) => message.id === event.id)) {
-          return prev;
-        }
-        return [...prev, toMessage(event)];
-      });
+      queuePlayback(toMessage(event), event.playbackDelayMs);
       return;
     }
 
@@ -71,8 +72,8 @@ function App() {
       }
       if (event.status === 'done' || event.status === 'failed') {
         setThinkingRole(null);
-        setIsRunning(false);
-        runLockRef.current = false;
+        serverDoneRef.current = true;
+        finishRunIfPlaybackIdle();
         loadHistory();
       }
       return;
@@ -80,8 +81,8 @@ function App() {
 
     if (event.type === 'done') {
       setThinkingRole(null);
-      setIsRunning(false);
-      runLockRef.current = false;
+      serverDoneRef.current = true;
+      finishRunIfPlaybackIdle();
       loadHistory();
       return;
     }
@@ -107,13 +108,17 @@ function App() {
 
   useEffect(() => {
     localStorage.setItem('activeMeetingId', meetingId);
-    if (activeHistory) {
+    if (activeHistory && liveMeetingRef.current !== meetingId && !isRunning && !playbackActiveRef.current && playbackQueueRef.current.length === 0) {
       loadMeeting(meetingId);
     }
-  }, [meetingId, activeHistory]);
+  }, [meetingId, activeHistory, isRunning]);
 
   useEffect(() => {
     loadHistory();
+  }, []);
+
+  useEffect(() => () => {
+    clearPlayback();
   }, []);
 
   async function loadHistory() {
@@ -138,8 +143,93 @@ function App() {
     }
 
     const payload = await response.json();
+    const loadedMessages = (payload.messages || []).map(toMessage);
+    displayedMessageIdsRef.current = new Set(loadedMessages.map((message) => message.id).filter(Boolean));
     setMeetingTitle(payload.meeting?.title || '未命名圆桌');
-    setMessages((payload.messages || []).map(toMessage));
+    setMessages(loadedMessages);
+  }
+
+  function queuePlayback(message, delayMs = CHAT_PLAYBACK_DELAY_MS) {
+    if (message.id && displayedMessageIdsRef.current.has(message.id)) {
+      return;
+    }
+    if (message.id) {
+      displayedMessageIdsRef.current.add(message.id);
+    }
+    playbackQueueRef.current.push({ message, delayMs });
+    void drainPlaybackQueue();
+  }
+
+  async function drainPlaybackQueue() {
+    if (playbackActiveRef.current) {
+      return;
+    }
+
+    playbackActiveRef.current = true;
+    while (playbackQueueRef.current.length) {
+      const item = playbackQueueRef.current.shift();
+      await playMessage(item.message, item.delayMs);
+    }
+    playbackActiveRef.current = false;
+    finishRunIfPlaybackIdle();
+  }
+
+  async function playMessage(message, delayMs = CHAT_PLAYBACK_DELAY_MS) {
+    setThinkingRole({
+      id: message.roleId,
+      name: message.speaker || message.roleName,
+      color: message.color,
+    });
+    await wait(delayMs);
+    setThinkingRole(null);
+
+    const animatedId = message.id || `playback-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const fullContent = String(message.content || '');
+    const animatedMessage = { ...message, id: animatedId, content: '', isStreaming: true };
+
+    setMessages((prev) => [...prev, animatedMessage]);
+
+    for (let index = 0; index < fullContent.length; index += TYPEWRITER_CHUNK_SIZE) {
+      const nextContent = fullContent.slice(0, index + TYPEWRITER_CHUNK_SIZE);
+      setMessages((prev) => prev.map((item) => (
+        item.id === animatedId ? { ...item, content: nextContent } : item
+      )));
+      await wait(TYPEWRITER_INTERVAL_MS);
+    }
+
+    setMessages((prev) => prev.map((item) => (
+      item.id === animatedId ? { ...item, content: fullContent, isStreaming: false } : item
+    )));
+    await wait(260);
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => {
+        playbackTimersRef.current = playbackTimersRef.current.filter((item) => item !== timer);
+        resolve();
+      }, ms);
+      playbackTimersRef.current.push(timer);
+    });
+  }
+
+  function clearPlayback() {
+    playbackQueueRef.current = [];
+    playbackActiveRef.current = false;
+    serverDoneRef.current = false;
+    for (const timer of playbackTimersRef.current) {
+      window.clearTimeout(timer);
+    }
+    playbackTimersRef.current = [];
+  }
+
+  function finishRunIfPlaybackIdle() {
+    if (!serverDoneRef.current || playbackActiveRef.current || playbackQueueRef.current.length) {
+      return;
+    }
+    setIsRunning(false);
+    runLockRef.current = false;
+    serverDoneRef.current = false;
   }
 
   function startMeeting() {
@@ -163,6 +253,9 @@ function App() {
     }
 
     setMeetingTitle(title);
+    clearPlayback();
+    displayedMessageIdsRef.current = new Set();
+    liveMeetingRef.current = meetingId;
     setMessages([]);
     setThinkingRole(null);
     setIsRunning(true);
@@ -174,6 +267,9 @@ function App() {
       return;
     }
     runLockRef.current = false;
+    clearPlayback();
+    displayedMessageIdsRef.current = new Set();
+    liveMeetingRef.current = null;
     setMeetingId(createMeetingId());
     setMeetingTitle('未命名圆桌');
     setMessages([]);
@@ -186,6 +282,9 @@ function App() {
       return;
     }
     runLockRef.current = false;
+    clearPlayback();
+    displayedMessageIdsRef.current = new Set();
+    liveMeetingRef.current = null;
     setMeetingId(id);
     setThinkingRole(null);
     setIsRunning(false);
@@ -263,6 +362,7 @@ function MessageBubble({ message, index }) {
     message.type === 'error' ? 'error' : '',
     message.type === 'system' ? 'system' : '',
     message.type === 'summary' || isSummaryMessage(message) ? 'summary' : '',
+    message.isStreaming ? 'streaming' : '',
   ].filter(Boolean).join(' ');
 
   return (
