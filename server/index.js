@@ -26,6 +26,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     title TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
+    summary_json TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -59,6 +60,9 @@ const meetingColumns = db.prepare('PRAGMA table_info(meetings)').all().map((colu
 if (!meetingColumns.includes('status')) {
   db.exec("ALTER TABLE meetings ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
 }
+if (!meetingColumns.includes('summary_json')) {
+  db.exec('ALTER TABLE meetings ADD COLUMN summary_json TEXT');
+}
 
 const messageColumns = db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name);
 if (!messageColumns.includes('stage')) {
@@ -79,6 +83,11 @@ const ensureMeeting = db.prepare(`
 const updateMeetingStatus = db.prepare(`
   UPDATE meetings
   SET status = @status
+  WHERE id = @id
+`);
+const updateMeetingSummaryJson = db.prepare(`
+  UPDATE meetings
+  SET summary_json = @summaryJson
   WHERE id = @id
 `);
 const insertMessage = db.prepare(`
@@ -102,7 +111,7 @@ const listMeetings = db.prepare(`
   ORDER BY meetings.created_at DESC
 `);
 const getMeeting = db.prepare(`
-  SELECT id, title, status, created_at AS createdAt
+  SELECT id, title, status, summary_json AS summaryJson, created_at AS createdAt
   FROM meetings
   WHERE id = ?
 `);
@@ -215,6 +224,16 @@ const server = http.createServer((req, res) => {
       }
 
       void handleFollowupRequest(req, res, meetingId);
+      return;
+    }
+
+    if (segments.length === 2 && segments[1] === 'export') {
+      if (req.method !== 'GET') {
+        sendHttpJson(res, 405, { error: 'method_not_allowed' });
+        return;
+      }
+
+      handleExportRequest(res, meetingId);
       return;
     }
 
@@ -349,6 +368,124 @@ function createBroadcaster() {
     },
   };
 }
+
+function handleExportRequest(res, meetingId) {
+  const meeting = getMeeting.get(meetingId);
+  if (!meeting) {
+    sendHttpJson(res, 404, { error: 'meeting_not_found' });
+    return;
+  }
+  const messages = listMessagesByMeeting.all(meetingId);
+  const markdown = buildMeetingMarkdown(meeting, messages);
+  const filename = `${sanitizeFilename(meeting.title || meetingId)}.md`;
+  res.writeHead(200, {
+    'content-type': 'text/markdown; charset=utf-8',
+    'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+  });
+  res.end(markdown);
+}
+
+// 用结构化的 stage/round/role_id 数据 + 结构化总结，拼一份干净的 Markdown 决策报告。
+function buildMeetingMarkdown(meeting, messages) {
+  const roleMessages = messages.filter((message) => message.speaker !== SUMMARY_ROLE.name);
+  const summaryMessages = messages.filter((message) => message.speaker === SUMMARY_ROLE.name);
+  const lines = [];
+
+  lines.push(`# ${meeting.title || '未命名圆桌'}`);
+  lines.push('');
+  lines.push(`- 状态：${formatStatusLabel(meeting.status)}`);
+  lines.push(`- 创建时间：${meeting.createdAt || '—'}`);
+  const expertNames = [...new Set(roleMessages.map((message) => message.speaker))];
+  lines.push(`- 参与专家（${expertNames.length}）：${expertNames.join('、') || '—'}`);
+  lines.push('');
+
+  // 结构化总结优先（核心结论先行，符合决策报告习惯）。
+  const structured = safeParseJson(meeting.summaryJson);
+  if (structured) {
+    lines.push('## 会议总结');
+    lines.push('');
+    if (structured.core) {
+      lines.push(`**核心结论：** ${structured.core}`);
+      lines.push('');
+    }
+    appendMarkdownList(lines, '共识', structured.consensus);
+    appendMarkdownList(lines, '分歧', structured.disputes);
+    appendMarkdownList(lines, '行动建议', structured.actions);
+    appendMarkdownList(lines, '风险提示', structured.risks);
+  } else if (summaryMessages.length) {
+    lines.push('## 会议总结');
+    lines.push('');
+    lines.push(summaryMessages[summaryMessages.length - 1].content || '');
+    lines.push('');
+  }
+
+  // 分阶段/轮次的发言记录。
+  const grouped = groupMessagesForExport(roleMessages);
+  for (const group of grouped) {
+    lines.push(`## ${group.title}`);
+    lines.push('');
+    for (const message of group.items) {
+      lines.push(`### ${message.speaker}`);
+      lines.push('');
+      lines.push(String(message.content || '').trim());
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
+function groupMessagesForExport(roleMessages) {
+  const buckets = new Map();
+  for (const message of roleMessages) {
+    const stage = message.stage || 'discussion';
+    const round = message.round || 1;
+    const key = stage === 'followup' ? `followup-${round}` : `discussion-${round}`;
+    const title = stage === 'followup' ? `追问第 ${round} 轮` : `讨论第 ${round} 轮`;
+    if (!buckets.has(key)) {
+      buckets.set(key, { key, stage, round, title, items: [] });
+    }
+    buckets.get(key).items.push(message);
+  }
+  // discussion 在前、followup 在后，各按轮次升序。
+  return [...buckets.values()].sort((a, b) => {
+    if (a.stage !== b.stage) {
+      return a.stage === 'followup' ? 1 : -1;
+    }
+    return a.round - b.round;
+  });
+}
+
+function appendMarkdownList(lines, title, items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return;
+  }
+  lines.push(`**${title}：**`);
+  for (const item of items) {
+    lines.push(`- ${item}`);
+  }
+  lines.push('');
+}
+
+function formatStatusLabel(status) {
+  return ({ pending: '待开始', running: '进行中', done: '已完成', failed: '失败' })[status] || status || '—';
+}
+
+function safeParseJson(value) {
+  if (!value || typeof value !== 'string') {
+    return null;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeFilename(name) {
+  return String(name || 'meeting').replace(/[\\/:*?"<>|]/g, '_').slice(0, 80) || 'meeting';
+}
+
 
 function broadcastJson(payload) {
   const data = JSON.stringify(payload);
@@ -632,11 +769,38 @@ function buildSummaryWorkflow(roles, topic, roundMessages) {
       id: SUMMARY_ROLE.id,
       role: SUMMARY_ROLE.id,
       name: SUMMARY_ROLE.name,
-      task: `以${SUMMARY_ROLE.name}身份发言：请基于完整圆桌内容整理会议总结。\n\n会议主题：${topic}\n\n参与角色：${roleNames}\n\n圆桌发言：\n${transcript}\n\n要求：控制在 300-500 字，输出三段：1. 结论 2. 关键分歧 3. 下一步行动建议。`,
+      task: buildSummaryTask(topic, roleNames, transcript),
       output: 'meeting_summary',
       depends_on: undefined,
     }],
   };
+}
+
+// 总结 prompt：先输出结构化 JSON（供 summary_json 落库 / 移动端抽屉 / 导出），
+// 再输出可读 Markdown 正文（前端不动时仍能渲染，且 JSON 解析失败时兜底）。
+function buildSummaryTask(topic, roleNames, transcript, contextBlock = '') {
+  return `以${SUMMARY_ROLE.name}身份发言：请基于圆桌内容整理会议总结。
+
+会议主题：${topic}${contextBlock}
+
+参与角色：${roleNames}
+
+圆桌发言：
+${transcript}
+
+请严格按以下两部分输出，顺序不可颠倒：
+
+第一部分：一个 JSON 代码块（用 \`\`\`json 包裹），字段如下，全部为中文：
+{
+  "core": "一句话核心结论",
+  "consensus": ["共识要点1", "共识要点2"],
+  "disputes": ["关键分歧1", "关键分歧2"],
+  "actions": ["下一步行动1", "下一步行动2"],
+  "risks": ["风险提示1", "风险提示2"]
+}
+数组每项为一句简短中文，consensus/actions 各 2-4 条，disputes/risks 各 1-3 条。
+
+第二部分：JSON 之后另起一行，输出 300-500 字的可读总结正文，分三段：1. 结论 2. 关键分歧 3. 下一步行动建议。`;
 }
 
 function topicFocusInstruction(topic) {
@@ -655,7 +819,7 @@ function buildSummaryStep(roles, topic, roleSteps, contextText = '') {
     id: SUMMARY_ROLE.id,
     role: SUMMARY_ROLE.id,
     name: SUMMARY_ROLE.name,
-    task: `以${SUMMARY_ROLE.name}身份发言：请基于本轮圆桌内容整理会议总结。\n\n会议主题：${topic}${contextBlock}\n\n参与角色：${roleNames}\n\n输出三段：1. 结论 2. 分歧 3. 行动建议。`,
+    task: buildSummaryTask(topic, roleNames, '（见上下文）', contextBlock),
     output: 'meeting_summary',
     depends_on: roleSteps.map((step) => step.id),
     depends_on_mode: 'any_completed',
@@ -735,7 +899,15 @@ function createMockSpeech(roleName, topic, userMessage) {
 }
 
 function createMockSummary(topic) {
-  return `1. 结论\n围绕「${topic}」，本轮圆桌更倾向于先做结构化评估，再推进低风险动作，而不是直接一步到位。\n\n2. 关键分歧\n分歧主要在执行速度和风险控制之间：一方关注尽快达成目标，另一方关注流程、合规和组织影响。\n\n3. 下一步行动建议\n先列出可替代方案、关键风险点和必要留痕材料，再决定具体执行路径。`;
+  // 与真实总结 prompt 一致：先 JSON 代码块，再可读正文，便于 parseSummaryStructure 解析。
+  const structured = {
+    core: `围绕「${topic}」，本轮圆桌更倾向于先做结构化评估，再推进低风险动作。`,
+    consensus: ['先评估再行动', '风险与成本需同步纳入考量'],
+    disputes: ['执行速度与风险控制之间存在取舍'],
+    actions: ['列出可替代方案', '梳理关键风险点', '准备必要留痕材料'],
+    risks: ['流程不清可能放大后续代价'],
+  };
+  return `\`\`\`json\n${JSON.stringify(structured, null, 2)}\n\`\`\`\n\n1. 结论\n围绕「${topic}」，本轮圆桌更倾向于先做结构化评估，再推进低风险动作，而不是直接一步到位。\n\n2. 关键分歧\n分歧主要在执行速度和风险控制之间：一方关注尽快达成目标，另一方关注流程、合规和组织影响。\n\n3. 下一步行动建议\n先列出可替代方案、关键风险点和必要留痕材料，再决定具体执行路径。`;
 }
 
 function createRoundtableConnector(meetingId, meetingTitle, emit, roles, getStageMeta) {
@@ -752,10 +924,17 @@ function createRoundtableConnector(meetingId, meetingTitle, emit, roles, getStag
         model: DEEPSEEK_MODEL,
         timeout: config.timeout || ROLE_TIMEOUT_MS,
       }), config.timeout || ROLE_TIMEOUT_MS);
-      const content = result.content;
+      const rawContent = result.content;
       const roleName = currentRoleName(userMessage);
       const role = currentRole(roles, roleName);
       const isSummary = role.id === SUMMARY_ROLE.id;
+      // 总结：从原文解析结构化字段，然后剥掉 JSON 块只留可读正文落库/下发。
+      let structured = null;
+      let content = rawContent;
+      if (isSummary) {
+        structured = parseSummaryStructure(rawContent);
+        content = stripSummaryJsonBlock(rawContent);
+      }
       // 总结独立成段；其余发言落到 resolveStageMeta() 给出的 discussion/followup 阶段与轮次。
       const meta = isSummary ? { stage: 'summary', round: null } : resolveStageMeta();
       const insertResult = storeSpeech({
@@ -769,6 +948,10 @@ function createRoundtableConnector(meetingId, meetingTitle, emit, roles, getStag
       });
       const messageType = isSummary ? 'summary' : 'speech';
 
+      if (isSummary && structured) {
+        updateMeetingSummaryJson.run({ id: meetingId, summaryJson: JSON.stringify(structured) });
+      }
+
       emit({
         type: 'speech',
         messageType,
@@ -778,6 +961,7 @@ function createRoundtableConnector(meetingId, meetingTitle, emit, roles, getStag
         content,
         stage: meta.stage,
         round: meta.round,
+        structured,
         id: insertResult.lastInsertRowid,
         playbackDelayMs: isSummary ? DISCUSSION_DELAY_MS * 2 : DISCUSSION_DELAY_MS,
       });
@@ -1094,6 +1278,101 @@ function parseSelectedRoles(content) {
     throw new Error('DeepSeek role selection must be a JSON array');
   }
   return value;
+}
+
+// 从总结正文里抽取结构化字段；复用选角同款"提取首个 JSON 对象 + 解析失败兜底"思路。
+// 解析失败返回 null，调用方据此回退到 Markdown 渲染，绝不阻塞会议。
+function parseSummaryStructure(content) {
+  const text = String(content || '');
+  const start = text.indexOf('{');
+  const end = text.indexOf('}', start) === -1 ? -1 : matchingBraceEnd(text, start);
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+  let raw;
+  try {
+    raw = JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const toList = (value) => (Array.isArray(value) ? value : [value])
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean);
+  const core = typeof raw.core === 'string' ? raw.core.trim() : '';
+  const structured = {
+    core,
+    consensus: toList(raw.consensus),
+    disputes: toList(raw.disputes),
+    actions: toList(raw.actions),
+    risks: toList(raw.risks),
+  };
+  // 至少要有核心结论或一条要点才算解析成功，否则当作失败兜底。
+  const hasContent = structured.core
+    || structured.consensus.length
+    || structured.disputes.length
+    || structured.actions.length
+    || structured.risks.length;
+  return hasContent ? structured : null;
+}
+
+// 找到与 start 处 '{' 配对的 '}'，忽略字符串内的花括号。
+function matchingBraceEnd(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+// 把总结正文里用于结构化解析的 JSON 块剥掉，只留可读正文。
+// 这样落库/下发的 content 仍是干净 Markdown，未升级的前端照常渲染；
+// 结构化数据走 summary_json 列与 WS 的 structured 字段。
+function stripSummaryJsonBlock(content) {
+  const text = String(content || '');
+  // 优先剥掉 ```json ... ``` 围栏
+  const fenced = text.replace(/```(?:json)?\s*[\s\S]*?```/i, '').trim();
+  if (fenced && fenced !== text.trim()) {
+    return fenced;
+  }
+  // 没有围栏时，剥掉开头的裸 JSON 对象
+  const start = text.indexOf('{');
+  if (start !== -1) {
+    const end = matchingBraceEnd(text, start);
+    if (end !== -1) {
+      const before = text.slice(0, start).trim();
+      const after = text.slice(end + 1).trim();
+      const prose = [before, after].filter(Boolean).join('\n\n');
+      if (prose) {
+        return prose;
+      }
+    }
+  }
+  return text.trim();
 }
 
 function resolveAgentsDir() {

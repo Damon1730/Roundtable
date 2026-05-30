@@ -100,6 +100,15 @@ async function test1_fullFlow() {
   const done = events.find((e) => e.type === 'done');
   assert(done.status === 'done', 'done.status=done');
 
+  // 阶段二：总结事件应带结构化字段（structured），且核心结论非空。
+  const summarySpeech = events.find((e) => e.type === 'speech' && e.roleId === 'summary');
+  assert(!!summarySpeech, '存在总结 speech 事件');
+  assert(summarySpeech?.structured && typeof summarySpeech.structured === 'object', '总结事件带 structured 字段');
+  assert(typeof summarySpeech?.structured?.core === 'string' && summarySpeech.structured.core.length > 0, 'structured.core 非空');
+  assert(Array.isArray(summarySpeech?.structured?.actions), 'structured.actions 为数组');
+  // 总结正文不应残留 JSON 代码块（前端未升级时仍渲染干净 Markdown）。
+  assert(!/```json/i.test(summarySpeech?.content || ''), '总结 content 已剥离 JSON 代码块');
+
   // Phase 2: 追问
   const followupPromise = collectEvents(ws, (e) => e.type === 'done', 30000);
   ws.send(JSON.stringify({
@@ -118,6 +127,17 @@ async function test1_fullFlow() {
   const followupDone = followupEvents.find((e) => e.type === 'done');
   assert(!!followupDone, '追问有done事件');
   assert(followupDone?.round === 1, 'done.round=1');
+
+  // 阶段二：Markdown 导出端点。
+  const exportRes = await fetch(`${BASE}/api/meeting/${encodeURIComponent(meetingId)}/export`);
+  assert(exportRes.status === 200, `导出端点返回 200 (got ${exportRes.status})`);
+  assert((exportRes.headers.get('content-type') || '').includes('text/markdown'), '导出 content-type 为 text/markdown');
+  const exportText = await exportRes.text();
+  assert(exportText.length > 0 && exportText.includes('# '), '导出 Markdown 非空且含标题');
+  assert(exportText.includes('会议总结'), '导出含会议总结小节');
+  // 不存在的会议导出应 404。
+  const exportMissing = await fetch(`${BASE}/api/meeting/does-not-exist-xyz/export`);
+  assert(exportMissing.status === 404, `导出不存在会议返回 404 (got ${exportMissing.status})`);
 }
 
 // ============================================================
