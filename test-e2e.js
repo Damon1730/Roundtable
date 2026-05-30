@@ -244,6 +244,28 @@ async function test3_timeoutNoBlock() {
   // 总结步骤使用depends_on_mode: 'any_completed'，所以即使B失败，总结仍应执行
   const summaryThinking = events.find((e) => e.type === 'thinking' && e.roleId === 'summary');
   assert(!!summaryThinking, '总结步骤仍然执行（any_completed模式）');
+
+  // 回归：单角色第一轮失败后，该会议仍能成功追问。
+  // 旧逻辑用 messageCount % roles.length 反推轮次，B 失败导致消息数除不尽，追问永久卡死。
+  const ws2 = await connectWs();
+  const followupPromise = collectEvents(ws2, (e) => e.type === 'done' || e.type === 'error', 15000);
+  ws2.send(JSON.stringify({
+    action: 'run_followup',
+    meetingId,
+    meetingTitle: '超时测试',
+    topic: '失败后追问',
+    roles: [
+      { id: 'r1', name: '角色A', prompt: '正常发言' },
+      { id: 'r2', name: '角色B', prompt: '正常发言' },
+      { id: 'r3', name: '角色C', prompt: '正常发言' },
+    ],
+  }));
+  const followupEvents = await followupPromise;
+  ws2.close();
+  const followupErr = followupEvents.find((e) => e.type === 'error');
+  const followupDone = followupEvents.find((e) => e.type === 'done');
+  assert(!followupErr, `失败角色的会议追问不被拒绝 (got error: ${followupErr?.code})`);
+  assert(!!followupDone && followupDone.status === 'done', '失败角色的会议仍能成功追问');
 }
 
 // ============================================================

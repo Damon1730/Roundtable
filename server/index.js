@@ -13,7 +13,6 @@ const ROLE_SELECTION_TIMEOUT_MS = Number(process.env.ROLE_SELECTION_TIMEOUT_MS |
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
 const AGENTS_DIR = process.env.AGENTS_DIR || resolveAgentsDir();
 const MAX_FOLLOWUP_ROUNDS = 2;
-const INITIAL_DISCUSSION_ROUNDS = 2;
 const ROUNDTABLE_CONCURRENCY = Number(process.env.ROUNDTABLE_CONCURRENCY || 3);
 const DISCUSSION_DELAY_MS = Number(process.env.ROUNDTABLE_DISCUSSION_DELAY_MS || 900);
 const SUMMARY_ROLE = { id: 'summary', name: '会议总结', prompt: '总结会议结论、分歧和行动建议。' };
@@ -35,6 +34,9 @@ db.exec(`
     meeting_id TEXT NOT NULL,
     speaker TEXT NOT NULL,
     content TEXT NOT NULL,
+    stage TEXT,
+    round INTEGER,
+    role_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (meeting_id) REFERENCES meetings(id)
   );
@@ -58,6 +60,17 @@ if (!meetingColumns.includes('status')) {
   db.exec("ALTER TABLE meetings ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
 }
 
+const messageColumns = db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name);
+if (!messageColumns.includes('stage')) {
+  db.exec('ALTER TABLE messages ADD COLUMN stage TEXT');
+}
+if (!messageColumns.includes('round')) {
+  db.exec('ALTER TABLE messages ADD COLUMN round INTEGER');
+}
+if (!messageColumns.includes('role_id')) {
+  db.exec('ALTER TABLE messages ADD COLUMN role_id TEXT');
+}
+
 const ensureMeeting = db.prepare(`
   INSERT INTO meetings (id, title, status)
   VALUES (@id, @title, @status)
@@ -69,8 +82,8 @@ const updateMeetingStatus = db.prepare(`
   WHERE id = @id
 `);
 const insertMessage = db.prepare(`
-  INSERT INTO messages (meeting_id, speaker, content)
-  VALUES (@meetingId, @speaker, @content)
+  INSERT INTO messages (meeting_id, speaker, content, stage, round, role_id)
+  VALUES (@meetingId, @speaker, @content, @stage, @round, @roleId)
 `);
 const insertSpeech = db.transaction((message) => {
   ensureMeeting.run({ id: message.meetingId, title: message.meetingTitle || null, status: 'pending' });
@@ -104,11 +117,41 @@ const countRoleMessagesByMeeting = db.prepare(`
   WHERE meeting_id = ? AND speaker != ?
 `);
 const listMessagesByMeeting = db.prepare(`
-  SELECT id, speaker, content, created_at AS createdAt
+  SELECT id, speaker, content, stage, round, role_id AS roleId, created_at AS createdAt
   FROM messages
   WHERE meeting_id = ?
   ORDER BY id ASC
 `);
+// 追问轮次的唯一真相：数据库里 stage='followup' 的最大 round。
+// 取代旧的 messageCount % roles.length 反推（单角色失败会卡死追问）。
+const maxFollowupRound = db.prepare(`
+  SELECT COALESCE(MAX(round), 0) AS round
+  FROM messages
+  WHERE meeting_id = ? AND stage = 'followup'
+`);
+// 初始讨论是否已产出过任意发言（追问就绪判断，不要求消息数整除角色数）。
+const countDiscussionSpeeches = db.prepare(`
+  SELECT COUNT(*) AS count
+  FROM messages
+  WHERE meeting_id = ? AND speaker != ? AND (stage IS NULL OR stage != 'followup')
+`);
+const deleteMeetingRoles = db.prepare(`
+  DELETE FROM meeting_roles
+  WHERE meeting_id = ?
+`);
+const deleteMeetingMessages = db.prepare(`
+  DELETE FROM messages
+  WHERE meeting_id = ?
+`);
+const deleteMeetingRow = db.prepare(`
+  DELETE FROM meetings
+  WHERE id = ?
+`);
+const deleteMeeting = db.transaction((meetingId) => {
+  deleteMeetingRoles.run(meetingId);
+  deleteMeetingMessages.run(meetingId);
+  return deleteMeetingRow.run(meetingId);
+});
 const upsertMeetingRole = db.prepare(`
   INSERT INTO meeting_roles (meeting_id, role_id, name, prompt, category, filename, reason, position)
   VALUES (@meetingId, @id, @name, @prompt, @category, @filename, @reason, @position)
@@ -172,6 +215,16 @@ const server = http.createServer((req, res) => {
       }
 
       void handleFollowupRequest(req, res, meetingId);
+      return;
+    }
+
+    if (req.method === 'DELETE' && segments.length === 1) {
+      const result = deleteMeeting(meetingId);
+      if (result.changes === 0) {
+        sendHttpJson(res, 404, { error: 'meeting_not_found' });
+        return;
+      }
+      sendHttpJson(res, 200, { ok: true, meetingId });
       return;
     }
 
@@ -252,23 +305,18 @@ async function handleFollowupRequest(req, res, meetingId) {
     const roles = resolveFollowupRoles(meetingId, payload.roles);
     const question = normalizeRequiredString(payload.question || payload.topic, 'question');
     const meetingTitle = normalizeOptionalString(payload.meetingTitle) || meeting.title || null;
-    const messageCount = countRoleMessagesByMeeting.get(meetingId, SUMMARY_ROLE.name).count;
 
-    if (messageCount < roles.length || messageCount % roles.length !== 0) {
-      sendHttpJson(res, 409, { error: 'meeting_not_ready' });
-      return;
-    }
-
-    const currentRound = Math.max(0, (messageCount / roles.length) - INITIAL_DISCUSSION_ROUNDS);
-    if (currentRound >= MAX_FOLLOWUP_ROUNDS) {
-      sendHttpJson(res, 409, { error: 'followup_limit_reached' });
+    // 与 runFollowup 共用同一份数据库权威的就绪/轮次判断。
+    const readiness = evaluateFollowupReadiness(meetingId);
+    if (!readiness.ready) {
+      sendHttpJson(res, 409, { error: readiness.reason });
       return;
     }
 
     sendHttpJson(res, 202, {
       ok: true,
       meetingId,
-      round: currentRound + 1,
+      round: readiness.nextRound,
       message: 'followup started',
     });
 
@@ -279,7 +327,6 @@ async function handleFollowupRequest(req, res, meetingId) {
         meetingTitle,
         topic: question,
         roles,
-        round: currentRound + 1,
       },
     ).catch((error) => {
       broadcastJson({
@@ -329,7 +376,9 @@ async function runRoundtable(ws, payload) {
 
   ensureMeeting.run({ id: meetingId, title: meetingTitle, status: 'pending' });
   saveMeetingRoles(meetingId, roles);
-  const connector = createRoundtableConnector(meetingId, meetingTitle, emit, [...roles, SUMMARY_ROLE]);
+  // stageMeta 在各 stage 之间串行切换；stage 内并发调用共享同一份，安全。
+  let stageMeta = { stage: 'discussion', round: 1 };
+  const connector = createRoundtableConnector(meetingId, meetingTitle, emit, [...roles, SUMMARY_ROLE], () => stageMeta);
   const agentsDir = ensureAgentFiles([...roles, SUMMARY_ROLE]);
   const runStage = (workflow, stageRoles = roles) => {
     const dag = buildDAG(workflow);
@@ -366,12 +415,15 @@ async function runRoundtable(ws, payload) {
   };
 
   updateMeetingState(meetingId, 'running', emit);
+  stageMeta = { stage: 'discussion', round: 1 };
   await runStage(buildRoundtableWorkflow(roles, topic));
   const firstRoundMessages = listRoundMessages(meetingId);
   if (firstRoundMessages.length > 1) {
     const responseRoles = roles.filter((role) => firstRoundMessages.some((message) => message.speaker === role.name));
+    stageMeta = { stage: 'discussion', round: 2 };
     await runStage(buildResponseWorkflow(responseRoles, topic, firstRoundMessages), responseRoles);
   }
+  stageMeta = { stage: 'summary', round: null };
   const result = await runStage(buildSummaryWorkflow(roles, topic, listRoundMessages(meetingId)), roles);
 
   if (meetingCompleted(result)) {
@@ -388,7 +440,6 @@ async function runFollowup(ws, payload) {
   const meetingTitle = normalizeOptionalString(payload.meetingTitle);
   const topic = normalizeRequiredString(payload.topic, 'topic');
   const roles = resolveFollowupRoles(meetingId, payload.roles);
-  const round = normalizeFollowupRound(payload.round);
 
   const meeting = getMeeting.get(meetingId);
   if (!meeting) {
@@ -396,17 +447,13 @@ async function runFollowup(ws, payload) {
     return;
   }
 
-  const messageCount = countRoleMessagesByMeeting.get(meetingId, SUMMARY_ROLE.name).count;
-  if (messageCount < roles.length || messageCount % roles.length !== 0) {
-    sendJson(ws, { type: 'error', code: 'meeting_not_ready', message: 'meeting_not_ready' });
+  // 轮次由数据库权威决定，不信任 payload.round。
+  const readiness = evaluateFollowupReadiness(meetingId);
+  if (!readiness.ready) {
+    sendJson(ws, { type: 'error', code: readiness.reason, message: readiness.reason });
     return;
   }
-
-  const currentRound = Math.max(0, (messageCount / roles.length) - INITIAL_DISCUSSION_ROUNDS);
-  if (currentRound >= MAX_FOLLOWUP_ROUNDS) {
-    sendJson(ws, { type: 'error', code: 'followup_limit_reached', message: 'followup_limit_reached' });
-    return;
-  }
+  const round = readiness.nextRound;
 
   const contextMessages = listMessagesByMeeting.all(meetingId);
   const workflow = buildFollowupWorkflow(roles, topic, contextMessages, round);
@@ -415,7 +462,13 @@ async function runFollowup(ws, payload) {
   const emitFn = typeof ws.send === 'function' && ws.readyState !== undefined
     ? (payload) => sendJson(ws, payload)
     : (payload) => ws.send(payload);
-  const connector = createRoundtableConnector(meetingId, meetingTitle || meeting.title || null, emitFn, [...roles, SUMMARY_ROLE]);
+  const connector = createRoundtableConnector(
+    meetingId,
+    meetingTitle || meeting.title || null,
+    emitFn,
+    [...roles, SUMMARY_ROLE],
+    () => ({ stage: 'followup', round }),
+  );
   const agentsDir = ensureAgentFiles([...roles, SUMMARY_ROLE]);
 
   updateMeetingState(meetingId, 'running', emitFn);
@@ -508,12 +561,20 @@ function updateMeetingState(meetingId, status, emit) {
   emit({ type: 'meeting_status', meetingId, status });
 }
 
-function normalizeFollowupRound(value) {
-  const round = Number(value || 1);
-  if (!Number.isInteger(round) || round < 1 || round > MAX_FOLLOWUP_ROUNDS) {
-    throw new Error('round must be 1 or 2');
+// 追问就绪与轮次的唯一真相来自数据库，不再用 messageCount % roles.length 反推
+// （单角色第一轮失败会让消息数除不尽，旧逻辑会永久卡死追问）。
+// ready：初始讨论已产出过任意发言即可。
+// nextRound：已有 followup 最大轮次 + 1；超过上限则 limit_reached。
+function evaluateFollowupReadiness(meetingId) {
+  const discussionSpeeches = countDiscussionSpeeches.get(meetingId, SUMMARY_ROLE.name).count;
+  if (discussionSpeeches < 1) {
+    return { ready: false, reason: 'meeting_not_ready' };
   }
-  return round;
+  const usedRounds = maxFollowupRound.get(meetingId).round;
+  if (usedRounds >= MAX_FOLLOWUP_ROUNDS) {
+    return { ready: false, reason: 'followup_limit_reached' };
+  }
+  return { ready: true, nextRound: usedRounds + 1 };
 }
 
 function nodeRoleId(node) {
@@ -677,8 +738,11 @@ function createMockSummary(topic) {
   return `1. 结论\n围绕「${topic}」，本轮圆桌更倾向于先做结构化评估，再推进低风险动作，而不是直接一步到位。\n\n2. 关键分歧\n分歧主要在执行速度和风险控制之间：一方关注尽快达成目标，另一方关注流程、合规和组织影响。\n\n3. 下一步行动建议\n先列出可替代方案、关键风险点和必要留痕材料，再决定具体执行路径。`;
 }
 
-function createRoundtableConnector(meetingId, meetingTitle, emit, roles) {
+function createRoundtableConnector(meetingId, meetingTitle, emit, roles, getStageMeta) {
   const connector = createDeepSeekConnector();
+  const resolveStageMeta = typeof getStageMeta === 'function'
+    ? getStageMeta
+    : () => ({ stage: 'discussion', round: null });
 
   return {
     async chat(systemPrompt, userMessage, config) {
@@ -691,8 +755,19 @@ function createRoundtableConnector(meetingId, meetingTitle, emit, roles) {
       const content = result.content;
       const roleName = currentRoleName(userMessage);
       const role = currentRole(roles, roleName);
-      const insertResult = storeSpeech({ meetingId, meetingTitle, speaker: roleName, content });
-      const messageType = role.id === SUMMARY_ROLE.id ? 'summary' : 'speech';
+      const isSummary = role.id === SUMMARY_ROLE.id;
+      // 总结独立成段；其余发言落到 resolveStageMeta() 给出的 discussion/followup 阶段与轮次。
+      const meta = isSummary ? { stage: 'summary', round: null } : resolveStageMeta();
+      const insertResult = storeSpeech({
+        meetingId,
+        meetingTitle,
+        speaker: roleName,
+        content,
+        stage: meta.stage,
+        round: meta.round,
+        roleId: role.id,
+      });
+      const messageType = isSummary ? 'summary' : 'speech';
 
       emit({
         type: 'speech',
@@ -701,8 +776,10 @@ function createRoundtableConnector(meetingId, meetingTitle, emit, roles) {
         roleId: role.id,
         roleName,
         content,
+        stage: meta.stage,
+        round: meta.round,
         id: insertResult.lastInsertRowid,
-        playbackDelayMs: role.id === SUMMARY_ROLE.id ? DISCUSSION_DELAY_MS * 2 : DISCUSSION_DELAY_MS,
+        playbackDelayMs: isSummary ? DISCUSSION_DELAY_MS * 2 : DISCUSSION_DELAY_MS,
       });
 
       return result;
@@ -725,6 +802,9 @@ function storeSpeech(message) {
     meetingTitle: message.meetingTitle || null,
     speaker: message.speaker,
     content: message.content,
+    stage: message.stage || null,
+    round: message.round ?? null,
+    roleId: message.roleId || null,
   });
 }
 
